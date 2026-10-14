@@ -470,3 +470,141 @@ func (s *S) TestCreateEmptyRoot(c *C) {
 	_, _, err = fsutil.CreateWriter(options)
 	c.Assert(err, ErrorMatches, "internal error: CreateOptions.Root is unset")
 }
+
+func entryOwnership(path string) (uid, gid int) {
+	info, err := os.Lstat(path)
+	if err != nil {
+		panic(err)
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		panic("unsupported system: not a syscall.Stat_t")
+	}
+	return int(stat.Uid), int(stat.Gid)
+}
+
+func (s *S) TestCreateOwnership(c *C) {
+	// Ownership can always be set to the current process user and group,
+	// even when running unprivileged. The unprivileged attempt to set
+	// other ids fails with EPERM, which is logged and otherwise ignored.
+	selfUid, selfGid := os.Getuid(), os.Getgid()
+	dir := c.MkDir()
+
+	uid, gid := selfUid, selfGid
+	_, err := fsutil.Create(&fsutil.CreateOptions{
+		Root: dir,
+		Path: "file",
+		Mode: 0644,
+		Data: bytes.NewBufferString("data1"),
+		Uid:  &uid,
+		Gid:  &gid,
+	})
+	c.Assert(err, IsNil)
+	gotUid, gotGid := entryOwnership(filepath.Join(dir, "file"))
+	c.Assert(gotUid, Equals, selfUid)
+	c.Assert(gotGid, Equals, selfGid)
+
+	// Directories are owned too.
+	_, err = fsutil.Create(&fsutil.CreateOptions{
+		Root:        dir,
+		Path:        "somedir",
+		Mode:        fs.ModeDir | 0755,
+		MakeParents: true,
+		Uid:         &uid,
+		Gid:         &gid,
+	})
+	c.Assert(err, IsNil)
+	gotUid, gotGid = entryOwnership(filepath.Join(dir, "somedir"))
+	c.Assert(gotUid, Equals, selfUid)
+	c.Assert(gotGid, Equals, selfGid)
+
+	// Ownership of pre-existing entries is only applied with
+	// OverrideMode, mirroring the mode semantics.
+	hack := func(root string) {
+		err := os.WriteFile(filepath.Join(root, "file"), []byte("data"), 0644)
+		c.Assert(err, IsNil)
+	}
+	root := c.MkDir()
+	hack(root)
+	rootUid, rootGid := 0, 0
+	if selfUid == 0 {
+		// Use an id different from the current ones for a meaningful
+		// assertion when running as root.
+		rootUid, rootGid = 0, 0
+	}
+	_, err = fsutil.Create(&fsutil.CreateOptions{
+		Root: root,
+		Path: "file",
+		Mode: 0644,
+		Data: bytes.NewBufferString("data"),
+		Uid:  &rootUid,
+		Gid:  &rootGid,
+	})
+	c.Assert(err, IsNil)
+	gotUid, gotGid = entryOwnership(filepath.Join(root, "file"))
+	if selfUid == 0 {
+		c.Assert(gotUid, Equals, rootUid)
+		c.Assert(gotGid, Equals, rootGid)
+	} else {
+		// Unchanged: the entry pre-existed and OverrideMode is unset.
+		c.Assert(gotUid, Equals, selfUid)
+		c.Assert(gotGid, Equals, selfGid)
+	}
+
+	root = c.MkDir()
+	hack(root)
+	_, err = fsutil.Create(&fsutil.CreateOptions{
+		Root:         root,
+		Path:         "file",
+		Mode:         0644,
+		Data:         bytes.NewBufferString("data"),
+		OverrideMode: true,
+		Uid:          &rootUid,
+		Gid:          &rootGid,
+	})
+	c.Assert(err, IsNil)
+	gotUid, gotGid = entryOwnership(filepath.Join(root, "file"))
+	if selfUid == 0 {
+		c.Assert(gotUid, Equals, rootUid)
+		c.Assert(gotGid, Equals, rootGid)
+	} else {
+		// EPERM is logged once and otherwise ignored.
+		c.Assert(gotUid, Equals, selfUid)
+		c.Assert(gotGid, Equals, selfGid)
+		c.Assert(c.GetTestLog(), Matches, "(?s).*WARNING: cannot preserve file ownership.*")
+	}
+
+	// Ownership of symlinks is never applied, not even via their target.
+	root = c.MkDir()
+	err = os.WriteFile(filepath.Join(root, "bar"), []byte("data"), 0644)
+	c.Assert(err, IsNil)
+	_, err = fsutil.Create(&fsutil.CreateOptions{
+		Root: root,
+		Path: "foo",
+		Link: "bar",
+		Mode: fs.ModeSymlink,
+		Uid:  &rootUid,
+		Gid:  &rootGid,
+	})
+	c.Assert(err, IsNil)
+	gotUid, gotGid = entryOwnership(filepath.Join(root, "bar"))
+	c.Assert(gotUid, Equals, selfUid)
+	c.Assert(gotGid, Equals, selfGid)
+
+	// CreateWriter applies ownership to newly created files too.
+	root = c.MkDir()
+	writer, _, err := fsutil.CreateWriter(&fsutil.CreateOptions{
+		Root: root,
+		Path: "file",
+		Mode: 0644,
+		Uid:  &uid,
+		Gid:  &gid,
+	})
+	c.Assert(err, IsNil)
+	_, err = writer.Write([]byte("data"))
+	c.Assert(err, IsNil)
+	c.Assert(writer.Close(), IsNil)
+	gotUid, gotGid = entryOwnership(filepath.Join(root, "file"))
+	c.Assert(gotUid, Equals, selfUid)
+	c.Assert(gotGid, Equals, selfGid)
+}

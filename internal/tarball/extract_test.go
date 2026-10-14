@@ -1,12 +1,15 @@
 package tarball_test
 
 import (
+	"archive/tar"
 	"bytes"
+	"io/fs"
 	"os"
 	"path"
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 
 	. "gopkg.in/check.v1"
 
@@ -626,5 +629,91 @@ func (s *S) TestExtractCreateCallback(c *C) {
 		c.Assert(err, IsNil)
 
 		c.Assert(createExtractInfos, DeepEquals, test.calls)
+	}
+}
+
+func (s *S) TestExtractOwnership(c *C) {
+	// Entries are created with the ownership recorded in the package
+	// tarball (e.g. the setgid-shadow group of the PAM chkpwd helpers).
+	// Applying ownership requires sufficient privilege (e.g. running as
+	// root); otherwise a warning is logged once and the entries keep the
+	// ownership of the current process user and group.
+	shadowGid := 42
+	entries := []testutil.TarEntry{{
+		Header: tar.Header{
+			Typeflag: tar.TypeDir,
+			Name:     "./usr/",
+			Mode:     0755,
+			Uid:      0,
+			Gid:      shadowGid,
+			Uname:    "root",
+			Gname:    "shadow",
+			Format:   tar.FormatGNU,
+		},
+	}, {
+		Header: tar.Header{
+			Typeflag: tar.TypeDir,
+			Name:     "./usr/sbin/",
+			Mode:     0755,
+			Uid:      0,
+			Gid:      shadowGid,
+			Uname:    "root",
+			Gname:    "shadow",
+			Format:   tar.FormatGNU,
+		},
+	}, {
+		Header: tar.Header{
+			Typeflag: tar.TypeReg,
+			Name:     "./usr/sbin/unix_chkpwd",
+			Mode:     02755,
+			Uid:      0,
+			Gid:      shadowGid,
+			Uname:    "root",
+			Gname:    "shadow",
+			Format:   tar.FormatGNU,
+		},
+		Content: []byte("chkpwd-binary-content"),
+	}}
+	pkgdata, err := testutil.MakeDeb(entries)
+	c.Assert(err, IsNil)
+
+	dir := c.MkDir()
+	// The ownership warnings are logged through fsutil's logger.
+	fsutil.SetLogger(c)
+	defer fsutil.SetLogger(nil)
+	options := tarball.ExtractOptions{
+		Package:   "test-package",
+		TargetDir: dir,
+		Extract: map[string][]tarball.ExtractInfo{
+			"/usr/sbin/unix_chkpwd": []tarball.ExtractInfo{{
+				Path: "/usr/sbin/unix_chkpwd",
+			}},
+		},
+	}
+	err = tarball.Extract(bytes.NewReader(pkgdata), &options)
+	c.Assert(err, IsNil)
+
+	info, err := os.Lstat(filepath.Join(dir, "usr/sbin/unix_chkpwd"))
+	c.Assert(err, IsNil)
+	c.Assert(info.Mode()&fs.ModeSetgid, Not(Equals), 0)
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	c.Assert(ok, Equals, true)
+	dirInfo, err := os.Lstat(filepath.Join(dir, "usr/sbin"))
+	c.Assert(err, IsNil)
+	dirStat, ok := dirInfo.Sys().(*syscall.Stat_t)
+	c.Assert(ok, Equals, true)
+	if os.Geteuid() == 0 {
+		// Ownership of the entry and its parent directories is
+		// preserved from the tarball.
+		c.Assert(stat.Uid, Equals, uint32(0))
+		c.Assert(stat.Gid, Equals, uint32(shadowGid))
+		c.Assert(dirStat.Gid, Equals, uint32(shadowGid))
+	} else {
+		// Without sufficient privilege the entries are owned by the
+		// current process user and group, and a warning is logged.
+		c.Assert(stat.Uid, Equals, uint32(os.Getuid()))
+		c.Assert(stat.Gid, Equals, uint32(os.Getgid()))
+		c.Assert(dirStat.Gid, Equals, uint32(os.Getgid()))
+		c.Assert(c.GetTestLog(), Matches, "(?s).*WARNING: cannot preserve file ownership.*")
 	}
 }
